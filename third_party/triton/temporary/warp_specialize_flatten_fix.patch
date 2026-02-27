@@ -1,0 +1,48 @@
+--- a/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp
++++ b/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization.cpp
+@@ -32,6 +32,20 @@ class NVGPUWarpSpecializationPass
+   void runOnFuncOp(triton::FuncOp funcOp) {
+     SmallVector<scf::ForOp> loops;
+     funcOp->walk([&](scf::ForOp forOp) {
+       if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName) &&
+           triton::getNumStagesOrDefault(forOp, numStages) > 1)
+         loops.push_back(forOp);
+     });
+     if (loops.empty())
+       return;
+
+     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
+     if (numWarps != 4)
+       return;
+
+     // FIXME: skip warpspec if there is else block. Need to improve
+     // CodePartitioning to correctly handle channels in else block.
+     bool hasElse = false;
+     funcOp->walk([&](scf::IfOp ifOp) {
+       if (ifOp.elseBlock()) {
+         for (Operation &op : ifOp.elseBlock()->getOperations()) {
+           hasElse = true;
+         }
+       }
+     });
+     if (hasElse)
+       return;
+
++    // FIXME: skip warpspec if any warp-specialized loop has tt.flatten.
++    // The circular buffer protocol created by doCodePartition requires
++    // numBuffers=numStages buffer slots and expects the consumer to have
++    // released each slot before the producer acquires it in a later iteration.
++    // With tt.flatten (sequential, non-overlapped execution), slots after
++    // slot 0 are never released by any consumer before the producer tries to
++    // acquire them, causing a deadlock for loops with 2+ iterations.
++    bool hasFlatten = false;
++    for (auto forOp : loops) {
++      if (forOp->hasAttr("tt.flatten")) {
++        hasFlatten = true;
++        break;
++      }
++    }
++    if (hasFlatten)
++      return;
++
+     OpBuilder builder(funcOp);

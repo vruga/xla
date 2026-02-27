@@ -338,6 +338,80 @@ TEST_F(GpuIrEmitterUnnestedTest, RunTritonCustomCallWithDeviceSideTMA) {
   EXPECT_TRUE(LiteralTestUtil::Equal(input_literal, results.at(0)));
 }
 
+TEST_F(GpuIrEmitterUnnestedTest, RunTritonCustomCallWithWarpSpecializeTMA) {
+  if (!backend()
+           .default_stream_executor()
+           ->GetDeviceDescription()
+           .cuda_compute_capability()
+           .IsAtLeastHopper()) {
+    GTEST_SKIP() << "Device-side TMA is only supported on Hopper and up.";
+  }
+
+  // A kernel that copies arg0 to arg1 using TMA with a 2-iteration loop
+  // marked {tt.flatten, tt.warp_specialize}. Without the fix in
+  // NVGPUWarpSpecializationPass, the circular buffer protocol deadlocks on
+  // the 2nd iteration because slot 1 is never released by the consumer
+  // before the producer tries to acquire it.
+  constexpr absl::string_view kWarpSpecTMAMLIRText = R"(
+    module {
+      tt.func public @warp_specialize_tma_kernel(
+          %arg0: !tt.ptr<f16, 1> {tt.divisibility = 16 : i32},
+          %arg1: !tt.ptr<f16, 1> {tt.divisibility = 16 : i32}) {
+        %c0_i32 = arith.constant 0 : i32
+        %c1_i32 = arith.constant 1 : i32
+        %c2_i32 = arith.constant 2 : i32
+        %c128_i32 = arith.constant 128 : i32
+        %c128_i64 = arith.constant 128 : i64
+        %c1_i64 = arith.constant 1 : i64
+        %c64_i32 = arith.constant 64 : i32
+
+        %desc0 = tt.make_tensor_descriptor %arg0, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : <f16>, <tensor<64x128xf16>>
+        %desc1 = tt.make_tensor_descriptor %arg1, [%c128_i32, %c128_i32], [%c128_i64, %c1_i64] : <f16>, <tensor<64x128xf16>>
+
+        scf.for %i = %c0_i32 to %c2_i32 step %c1_i32 : i32 {
+          %row = arith.muli %i, %c64_i32 : i32
+          %tile = tt.descriptor_load %desc0[%row, %c0_i32] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16>
+          tt.descriptor_store %desc1[%row, %c0_i32], %tile : !tt.tensordesc<tensor<64x128xf16>>, tensor<64x128xf16>
+          scf.yield
+        } {tt.flatten, tt.warp_specialize}
+        tt.return
+      }
+    }
+  )";
+
+  HloComputation::Builder computation_builder(TestName());
+
+  Shape shape = xla::ShapeUtil::MakeShape(xla::F16, {128, 128});
+  Shape scratch_shape = xla::ShapeUtil::MakeShape(xla::U8, {32768});
+  HloInstruction* param_0 = computation_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, shape, "arg_0"));
+
+  // HLO operand {param_0} -> Triton arg0.
+  // HLO output tuple element 0 -> Triton arg1.
+  // HLO output tuple element 1 -> Triton arg2 (implicit scratchpad).
+  computation_builder.AddInstruction(CreateTritonCustomCall(
+      ShapeUtil::MakeTupleShape({shape, scratch_shape}), {param_0},
+      kWarpSpecTMAMLIRText, "warp_specialize_tma_kernel",
+      /*is_tma_allowed=*/true, /*global_scratch_memory_size=*/32768,
+      /*grid_x=*/1, /*grid_y=*/1));
+
+  auto module = CreateNewVerifiedModule();
+  module->AddEntryComputation(computation_builder.Build());
+
+  // Initialize input data.
+  Literal input_literal =
+      LiteralUtil::CreateFullWithDescendingLayout<float>({128, 128}, 1.0f);
+  input_literal = input_literal.Convert(F16).value();
+
+  // Run on GPU.
+  absl::StatusOr<Literal> result_status =
+      Execute(std::move(module), {&input_literal});
+  TF_ASSERT_OK(result_status.status());
+  std::vector<Literal> results = result_status->DecomposeTuple();
+
+  EXPECT_TRUE(LiteralTestUtil::Equal(input_literal, results.at(0)));
+}
+
 TEST_F(GpuIrEmitterUnnestedTest, CanNotEmitTritonCustomCallOnPreAmpereGpu) {
   if (GetCudaComputeCapability().IsAtLeastAmpere()) {
     GTEST_SKIP() << "Running on Ampere or more recent GPU, skipping.";
